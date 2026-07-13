@@ -29,6 +29,9 @@ classifiers = [
 ]
 
 dependencies = [
+    "accelerate",
+    "transformers",
+    "datasets",
     "gliner",
     "peft",
     "pydantic>=2.0.0",
@@ -41,3 +44,24 @@ dynamic = ["version"]
 [project.urls]
 Homepage = "https://github.com/fastino-ai/GLiNER2"
 Repository = "https://github.com/fastino-ai/GLiNER2"
+
+[tool.mypy]
+python_version = "3.12"
+ignore_missing_imports = true
+no_implicit_optional = false
+allow_redefinition = true
+disable_error_code = [
+    "arg-type",
+    "assignment",
+    "attr-defined",
+    "call-overload",
+    "dict-item",
+    "index",
+    "method-assign",
+    "misc",
+    "operator",
+    "override",
+    "return-value",
+    "union-attr",
+    "var-annotated",
+]
