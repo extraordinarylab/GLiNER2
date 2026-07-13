@@ -52,7 +52,9 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
+import torch.distributed as dist
 import torch.nn as nn
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.cuda.amp import GradScaler, autocast
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
@@ -525,6 +527,11 @@ class GLiNER2Trainer:
         self.eval_data = eval_data
         self.compute_metrics = compute_metrics
 
+        self.rank = int(os.environ.get("RANK", "0"))
+        self.world_size = int(os.environ.get("WORLD_SIZE", "1"))
+        if self.config.local_rank < 0 and "LOCAL_RANK" in os.environ:
+            self.config.local_rank = int(os.environ["LOCAL_RANK"])
+
         self._setup_seed()
         self._setup_device()
         self._setup_output_dir()
@@ -546,6 +553,7 @@ class GLiNER2Trainer:
         # LoRA state
         self.lora_layers = {}
         self._setup_lora()
+        self._setup_ddp()
 
     def _setup_seed(self):
         seed = self.config.seed
@@ -561,15 +569,31 @@ class GLiNER2Trainer:
 
     def _setup_device(self):
         if self.config.local_rank >= 0:
-            torch.cuda.set_device(self.config.local_rank)
-            self.device = torch.device("cuda", self.config.local_rank)
+            if not dist.is_initialized():
+                backend = "nccl" if torch.cuda.is_available() else "gloo"
+                dist.init_process_group(backend=backend)
+            self.rank = dist.get_rank()
+            self.world_size = dist.get_world_size()
+            if torch.cuda.is_available():
+                torch.cuda.set_device(self.config.local_rank)
+                self.device = torch.device("cuda", self.config.local_rank)
+            else:
+                self.device = torch.device("cpu")
+                if self.config.fp16 or self.config.bf16:
+                    logger.warning("Mixed precision disabled on CPU")
+                    self.config.fp16 = False
+                    self.config.bf16 = False
             self.is_distributed = True
         elif torch.cuda.is_available():
             self.device = torch.device("cuda")
             self.is_distributed = False
+            self.rank = 0
+            self.world_size = 1
         else:
             self.device = torch.device("cpu")
             self.is_distributed = False
+            self.rank = 0
+            self.world_size = 1
             if self.config.fp16 or self.config.bf16:
                 logger.warning("Mixed precision disabled on CPU")
                 self.config.fp16 = False
@@ -584,6 +608,8 @@ class GLiNER2Trainer:
             self.output_dir.mkdir(parents=True, exist_ok=True)
             self.logs_dir.mkdir(exist_ok=True)
             self.config.save(str(self.output_dir / "training_config.json"))
+        if self.is_distributed:
+            dist.barrier()
 
     def _setup_logging(self):
         logging.basicConfig(
@@ -617,27 +643,54 @@ class GLiNER2Trainer:
             logger.info("LoRA is disabled")
             return
 
-        for p in self.model.parameters():
+        model = self._unwrap_model()
+        for p in model.parameters():
             p.requires_grad = False
         logger.info("Froze all model parameters for LoRA training")
 
-        self.model = self.model.apply_lora(
+        model = model.apply_lora(
             r=self.config.lora_r, alpha=self.config.lora_alpha,
             dropout=self.config.lora_dropout,
             targets=self.config.lora_target_modules,
             use_dora=self.config.lora_use_dora,
         )
-        self.lora_layers = {n: m for n, m in self.model.named_modules() if isinstance(m, _PeftLoraLayer)}
-        self.model._lora_layers = self.lora_layers
+        if isinstance(self.model, DDP):
+            self.model.module = model
+        else:
+            self.model = model
+        self.lora_layers = {n: m for n, m in model.named_modules() if isinstance(m, _PeftLoraLayer)}
+        model._lora_layers = self.lora_layers
 
-        lora_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
-        total_params = sum(p.numel() for p in self.model.parameters())
+        lora_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        total_params = sum(p.numel() for p in model.parameters())
         pct = (lora_params / total_params * 100) if total_params > 0 else 0.0
         logger.info(f"LoRA setup complete: {lora_params:,} trainable / {total_params:,} total ({pct:.2f}%)")
 
+    def _setup_ddp(self):
+        """Wrap the model for torchrun/DDP training."""
+        if not self.is_distributed:
+            return
+        if isinstance(self.model, DDP):
+            return
+        self.model = DDP(
+            self.model,
+            device_ids=[self.config.local_rank] if self.device.type == "cuda" else None,
+            output_device=self.config.local_rank if self.device.type == "cuda" else None,
+            find_unused_parameters=True,
+        )
+        logger.info(
+            "Distributed training enabled: rank %s/%s, local_rank=%s",
+            self.rank,
+            self.world_size,
+            self.config.local_rank,
+        )
+
+    def _unwrap_model(self):
+        return self.model.module if isinstance(self.model, DDP) else self.model
+
     @property
     def is_main_process(self) -> bool:
-        return self.config.local_rank <= 0
+        return self.rank == 0
 
     @staticmethod
     def _safe_divide(numerator: float, denominator: float, default: float = 0.0) -> float:
@@ -773,7 +826,7 @@ class GLiNER2Trainer:
             sampler = DistributedSampler(dataset, shuffle=shuffle)
             shuffle = False
 
-        max_len = self.config.max_len or getattr(self.model.config, "max_len", None)
+        max_len = self.config.max_len or getattr(self._unwrap_model().config, "max_len", None)
         collator = ExtractorCollator(self.processor, is_training=is_training, max_len=max_len)
 
         # Fix Bug #1 & #9: Handle small datasets
@@ -879,9 +932,10 @@ class GLiNER2Trainer:
         logger.info("***** Running Training *****")
         logger.info(f"  Num examples = {len(train_dataset)}")
         logger.info(f"  Num epochs = {num_epochs}")
-        logger.info(f"  Batch size = {self.config.batch_size}")
+        logger.info(f"  Batch size per process = {self.config.batch_size}")
+        logger.info(f"  World size = {self.world_size}")
         logger.info(f"  Gradient accumulation steps = {self.config.gradient_accumulation_steps}")
-        logger.info(f"  Effective batch size = {self.config.effective_batch_size}")
+        logger.info(f"  Effective global batch size = {self.config.batch_size * self.world_size * self.config.gradient_accumulation_steps}")
         logger.info(f"  Total optimization steps = {max_steps}")
         logger.info(f"  Warmup steps = {warmup_steps}")
         
@@ -988,8 +1042,8 @@ class GLiNER2Trainer:
                             learning_rate=self.scheduler.get_last_lr()[0],
                             epoch=epoch + epoch_progress,
                             step=self.global_step,
-                            samples_seen=samples_seen,
-                            throughput=self._safe_divide(samples_seen, elapsed, default=0.0),
+                            samples_seen=samples_seen * self.world_size,
+                            throughput=self._safe_divide(samples_seen * self.world_size, elapsed, default=0.0),
                         )
                         self._log_metrics(metrics, prefix="train")
                         tr_loss = 0.0
@@ -1113,6 +1167,21 @@ class GLiNER2Trainer:
             "epoch": self.epoch,
         }
 
+        if self.is_distributed:
+            totals = torch.tensor(
+                [total_loss, total_cls_loss, total_struct_loss, total_count_loss, num_batches],
+                device=self.device,
+                dtype=torch.float64,
+            )
+            dist.all_reduce(totals, op=dist.ReduceOp.SUM)
+            total_loss, total_cls_loss, total_struct_loss, total_count_loss, num_batches = totals.tolist()
+            metrics.update({
+                "eval_loss": self._safe_divide(total_loss, num_batches, default=0.0),
+                "eval_classification_loss": self._safe_divide(total_cls_loss, num_batches, default=0.0),
+                "eval_structure_loss": self._safe_divide(total_struct_loss, num_batches, default=0.0),
+                "eval_count_loss": self._safe_divide(total_count_loss, num_batches, default=0.0),
+            })
+
         if self.compute_metrics:
             metrics.update(self.compute_metrics(self.model, eval_dataset))
 
@@ -1208,6 +1277,7 @@ class GLiNER2Trainer:
         checkpoint_dir.mkdir(exist_ok=True)
 
         save_start = time.time()
+        model_to_save = self._unwrap_model()
 
         if self.config.use_lora and self.config.save_adapter_only:
             # PEFT-native format only: ``self.model`` is a ``PeftModel``, so
@@ -1225,18 +1295,18 @@ class GLiNER2Trainer:
             # shape can invoke ``save_lora_adapter`` directly on a
             # checkpoint dir after training — the shim is preserved with
             # ``PendingDeprecationWarning`` in ``gliner2/training/lora.py``.
-            self.model.save_pretrained(str(checkpoint_dir))
+            model_to_save.save_pretrained(str(checkpoint_dir))
             checkpoint_type = "adapter"
-            trainable_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+            trainable_params = sum(p.numel() for p in model_to_save.parameters() if p.requires_grad)
         else:
-            if self.config.use_lora and isinstance(self.model, PeftModel):
-                self.model.merge_adapter()
-                self.model.get_base_model().save_pretrained(str(checkpoint_dir))
-                self.model.unmerge_adapter()
+            if self.config.use_lora and isinstance(model_to_save, PeftModel):
+                model_to_save.merge_adapter()
+                model_to_save.get_base_model().save_pretrained(str(checkpoint_dir))
+                model_to_save.unmerge_adapter()
             else:
-                self.model.save_pretrained(str(checkpoint_dir))
+                model_to_save.save_pretrained(str(checkpoint_dir))
             checkpoint_type = "full"
-            trainable_params = sum(p.numel() for p in self.model.parameters())
+            trainable_params = sum(p.numel() for p in model_to_save.parameters())
         
         save_time = time.time() - save_start
         checkpoint_size_mb = sum(f.stat().st_size for f in checkpoint_dir.rglob('*') if f.is_file()) / (1024 * 1024)
@@ -1293,18 +1363,29 @@ class GLiNER2Trainer:
 
         if is_adapter:
             logger.info("Loading LoRA adapter from %s", checkpoint_path)
-            base = self.model.get_base_model() if isinstance(self.model, PeftModel) else self.model
-            self.model = PeftModel.from_pretrained(base, str(checkpoint_dir))
-            self.model.to(self.device)
-            self.lora_layers = {n: m for n, m in self.model.named_modules() if isinstance(m, _PeftLoraLayer)}
-            self.model._lora_layers = self.lora_layers
+            model_to_load = self._unwrap_model()
+            base = model_to_load.get_base_model() if isinstance(model_to_load, PeftModel) else model_to_load
+            loaded_model = PeftModel.from_pretrained(base, str(checkpoint_dir))
+            loaded_model.to(self.device)
+            if isinstance(self.model, DDP):
+                self.model.module = loaded_model
+            else:
+                self.model = loaded_model
+            self.lora_layers = {n: m for n, m in self._unwrap_model().named_modules() if isinstance(m, _PeftLoraLayer)}
+            self._unwrap_model()._lora_layers = self.lora_layers
         else:
-            self.model = self.model.__class__.from_pretrained(str(checkpoint_dir))
-            self.model.to(self.device)
+            model_cls = self._unwrap_model().__class__
+            loaded_model = model_cls.from_pretrained(str(checkpoint_dir))
+            loaded_model.to(self.device)
+            if isinstance(self.model, DDP):
+                self.model.module = loaded_model
+            else:
+                self.model = loaded_model
             if self.config.use_lora:
                 logger.info("Applying LoRA to loaded model...")
                 self.lora_layers = {}
                 self._setup_lora()
+                self._setup_ddp()
 
         logger.info("Loaded checkpoint: %s", checkpoint_path)
 

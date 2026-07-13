@@ -215,7 +215,7 @@ class CountLSTMv2(nn.Module):
         return self.transformer(output + pc_broadcast)
 
 
-class CountLSTMoE(nn.Module):
+class CountLSTMMoE(nn.Module):
     """
     Count-aware module with a Mixture-of-Experts projector.
 
@@ -224,7 +224,7 @@ class CountLSTMoE(nn.Module):
     hidden_size : int
         Model dimensionality (D).
     max_count   : int
-        Maximum # count steps L.
+        Maximum # count steps L.
     n_experts   : int, optional
         Number of FFN experts (default = 4).
     ffn_mult    : int, optional

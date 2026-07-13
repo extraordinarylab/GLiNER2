@@ -18,8 +18,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 logger = logging.getLogger(__name__)
-from gliner.modeling.span_rep import SpanRepLayer
-from gliner2.layers import CountLSTMoE, CountLSTM, create_mlp, CountLSTMv2
+from gliner2.span_rep import SpanRepLayer
+from gliner2.layers import CountLSTMMoE, CountLSTM, create_mlp, CountLSTMv2
 from gliner2.processor import SchemaTransformer, PreprocessedBatch, SamplingConfig
 from safetensors.torch import save_file, load_file
 from transformers import (
@@ -130,7 +130,7 @@ class Extractor(PreTrainedModel):
         if config.counting_layer == "count_lstm":
             self.count_embed = CountLSTM(self.hidden_size)
         elif config.counting_layer == "count_lstm_moe":
-            self.count_embed = CountLSTMoE(
+            self.count_embed = CountLSTMMoE(
                 hidden_size=self.hidden_size,
                 n_experts=4,
                 ffn_mult=2,
