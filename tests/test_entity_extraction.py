@@ -116,7 +116,20 @@ def test_duplicate_entities_at_different_positions():
     assert len(result["name"]) == 2, "Both occurrences of 'John' should be returned"
 
 
+def test_duplicate_dict_entities_at_different_positions():
+    """Formatted span dictionaries must also retain repeated surface forms."""
+    entities = {
+        "name": [
+            {"text": "John", "confidence": 0.99, "start": 11, "end": 15},
+            {"text": "John", "confidence": 0.98, "start": 35, "end": 39},
+        ]
+    }
+
+    result = GLiNER2._format_entity_dict(None, entities, include_confidence=True)
+
+    assert len(result["name"]) == 2
+
+
 if __name__ == "__main__":
     test_entity_extraction()
     test_batch_entity_extraction()
-

@@ -1,7 +1,7 @@
 import pytest
 
 from gliner2.processor import SchemaTransformer
-from gliner2.training.data import DataLoader_Factory, InputExample, TrainingDataset, ValidationError
+from gliner2.training.data import DataLoaderFactory, InputExample, TrainingDataset, ValidationError
 
 
 class FakeTokenizer:
@@ -91,7 +91,7 @@ def test_mismatched_span_text_raises_clear_error():
 
 
 def test_huggingface_schema_list_becomes_entity_descriptions():
-    records = DataLoader_Factory.load(
+    records = DataLoaderFactory.load(
         [
             {
                 "input": "Petronas paid 80 million dollars.",
@@ -136,7 +136,7 @@ def test_relation_dict_with_span_fields_normalizes_and_validates():
         "schema": [],
     }
 
-    records = DataLoader_Factory.load([record], shuffle=False, validate=True)
+    records = DataLoaderFactory.load([record], shuffle=False, validate=True)
 
     assert records[0]["output"]["relations"] == [
         {
@@ -162,10 +162,43 @@ def test_processor_handles_relation_dict_with_span_fields_without_validation():
     }
 
     processor = SchemaTransformer(tokenizer=FakeTokenizer())
-    batch = processor.collate_fn_train([(text, schema)])
+    batch = processor.collate_fn_inference([(text, schema)])
 
     assert batch.task_types[0] == ["relations"]
     assert batch.structure_labels[0] == [[1, [[[(0, 0)], [(2, 2)]]]]]
+
+
+def test_repeated_relation_arguments_use_explicit_offsets():
+    text = "July met July and thanked July."
+    schema = {
+        "relations": {
+            "thanks": [
+                {
+                    "head": {"text": "July", "start": 9, "end": 13},
+                    "tail": {"text": "July", "start": 26, "end": 30},
+                }
+            ]
+        }
+    }
+
+    processor = SchemaTransformer(tokenizer=FakeTokenizer())
+    batch = processor.collate_fn_inference([(text, schema)])
+
+    assert batch.structure_labels[0] == [[1, [[[(2, 2)], [(5, 5)]]]]]
+
+
+def test_span_beyond_max_len_is_marked_unmatched():
+    text = "Alice met Bob."
+    schema = {
+        "entities": {
+            "person": [{"text": "Bob", "start": 10, "end": 13}],
+        }
+    }
+
+    processor = SchemaTransformer(tokenizer=FakeTokenizer())
+    batch = processor.collate_fn_train([(text, schema)], max_len=2)
+
+    assert batch.structure_labels[0] == [[1, [[[(-1, -1)]]]]]
 
 
 def test_text_classification_record_collates():
@@ -180,7 +213,7 @@ def test_text_classification_record_collates():
         ]
     }
 
-    records = DataLoader_Factory.load([{"input": text, "output": schema, "schema": []}], shuffle=False, validate=True)
+    records = DataLoaderFactory.load([{"input": text, "output": schema, "schema": []}], shuffle=False, validate=True)
     processor = SchemaTransformer(tokenizer=FakeTokenizer())
     batch = processor.collate_fn_train([(records[0]["input"], records[0]["output"])])
 
