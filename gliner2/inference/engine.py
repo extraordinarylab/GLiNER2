@@ -137,6 +137,7 @@ class GLiNER2(Extractor):
                 metadata = {
                     "field_metadata": schema._field_metadata,
                     "entity_metadata": schema._entity_metadata,
+                    "entity_multi_label": getattr(schema, "_entity_multi_label", True),
                     "relation_metadata": getattr(schema, '_relation_metadata', {}),
                     "field_orders": schema._field_orders,
                     "entity_order": schema._entity_order,
@@ -155,6 +156,7 @@ class GLiNER2(Extractor):
                 entity_order = list(schema_dict["entities"].keys()) if isinstance(schema_dict.get("entities"), dict) else []
                 metadata = {
                     "field_metadata": {}, "entity_metadata": {},
+                    "entity_multi_label": schema_dict.get("entity_multi_label", True),
                     "relation_metadata": {}, "field_orders": {},
                     "entity_order": entity_order, "relation_order": [],
                     "classification_tasks": classification_tasks
@@ -406,9 +408,14 @@ class GLiNER2(Extractor):
             results[schema_name] = [] if schema_name == "entities" else {}
             return
 
-        # Predict count
-        count_logits = self.count_pred(embs[0].unsqueeze(0))
-        pred_count = int(count_logits.argmax(dim=1).item())
+        # Entity labels are represented as one structure containing a list of
+        # spans per entity type during training. Entity count prediction is not
+        # trained, so inference must use that same fixed count of one.
+        if schema_name == "entities":
+            pred_count = 1
+        else:
+            count_logits = self.count_pred(embs[0].unsqueeze(0))
+            pred_count = int(count_logits.argmax(dim=1).item())
 
         if pred_count <= 0 or span_info is None:
             if schema_name == "entities":
@@ -462,6 +469,7 @@ class GLiNER2(Extractor):
         """Extract entity results."""
         scores = span_scores[0, :, -text_len:]
         entity_results = OrderedDict()
+        spans_by_name = OrderedDict()
 
         for name in metadata.get("entity_order", entity_names):
             if name not in entity_names:
@@ -478,6 +486,24 @@ class GLiNER2(Extractor):
                 start_map, end_map
             )
 
+            spans_by_name[name] = (spans, dtype)
+
+        if not metadata.get("entity_multi_label", True):
+            winners = {}
+            for name, (spans, _) in spans_by_name.items():
+                for span in spans:
+                    key = (span[2], span[3])
+                    if key not in winners or span[1] > winners[key][1][1]:
+                        winners[key] = (name, span)
+            spans_by_name = OrderedDict(
+                (
+                    name,
+                    ([span for winner_name, span in winners.values() if winner_name == name], dtype),
+                )
+                for name, (_, dtype) in spans_by_name.items()
+            )
+
+        for name, (spans, dtype) in spans_by_name.items():
             if dtype == "list":
                 entity_results[name] = self._format_spans(spans, include_confidence, include_spans)
             else:
@@ -876,8 +902,11 @@ class GLiNER2(Extractor):
                     elif isinstance(span, dict):
                         # Handle dict format (with confidence/spans)
                         text = span.get("text", "")
-                        if text and text.lower() not in seen:
-                            seen.add(text.lower())
+                        start = span.get("start")
+                        end = span.get("end")
+                        key = (text.lower(), start, end)
+                        if text and key not in seen:
+                            seen.add(key)
                             unique.append(span)
                     else:
                         # Handle string format
@@ -937,17 +966,19 @@ class GLiNER2(Extractor):
 
     def extract_entities(self, text: str, entity_types, threshold: float = 0.5,
                         format_results: bool = True, include_confidence: bool = False,
-                        include_spans: bool = False, max_len: Optional[int] = None) -> Dict:
+                        include_spans: bool = False, max_len: Optional[int] = None,
+                        multi_label: bool = True) -> Dict:
         """Extract entities from text."""
-        schema = self.create_schema().entities(entity_types)
+        schema = self.create_schema().entities(entity_types, multi_label=multi_label)
         return self.extract(text, schema, threshold, format_results, include_confidence, include_spans, max_len=max_len)
 
     def batch_extract_entities(self, texts: List[str], entity_types, batch_size: int = 8,
                                threshold: float = 0.5, format_results: bool = True,
                                include_confidence: bool = False, include_spans: bool = False,
-                               max_len: Optional[int] = None) -> List[Dict]:
+                               max_len: Optional[int] = None,
+                               multi_label: bool = True) -> List[Dict]:
         """Batch extract entities."""
-        schema = self.create_schema().entities(entity_types)
+        schema = self.create_schema().entities(entity_types, multi_label=multi_label)
         return self.batch_extract(texts, schema, batch_size, threshold, 0, format_results, include_confidence, include_spans, max_len=max_len)
 
     def classify_text(self, text: str, tasks: Dict, threshold: float = 0.5,

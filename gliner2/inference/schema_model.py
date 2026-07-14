@@ -77,6 +77,10 @@ class SchemaInput(BaseModel):
         default=None,
         description="Entity types"
     )
+    entity_multi_label: bool = Field(
+        default=True,
+        description="Whether an exact entity span may have multiple types"
+    )
     structures: Optional[Dict[str, StructureInput]] = Field(
         default=None,
         description="Structure definitions"

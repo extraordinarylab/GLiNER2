@@ -119,6 +119,7 @@ class Schema:
         }
         self._field_metadata = {}
         self._entity_metadata = {}
+        self._entity_multi_label = True
         self._relation_metadata = {}
         self._field_orders = {}
         self._entity_order = []
@@ -179,14 +180,21 @@ class Schema:
         self,
         entity_types: Union[str, List[str], Dict[str, Union[str, Dict]]],
         dtype: Literal["str", "list"] = "list",
-        threshold: Optional[float] = None
+        threshold: Optional[float] = None,
+        multi_label: bool = True,
     ) -> 'Schema':
-        """Add entity extraction task."""
+        """Add entity extraction task.
+
+        Set ``multi_label=False`` for flat NER, where one exact text span may
+        have only its highest-scoring entity type. The default preserves
+        nested/multi-type extraction behavior.
+        """
         if self._active_builder:
             self._active_builder._auto_finish()
             self._active_builder = None
 
         entities = self._parse_entity_input(entity_types)
+        self._entity_multi_label = multi_label
 
         for name, config in entities.items():
             self.schema["entities"][name] = ""
@@ -299,7 +307,10 @@ class Schema:
         schema = cls()
 
         if validated.entities is not None:
-            schema.entities(validated.entities)
+            schema.entities(
+                validated.entities,
+                multi_label=validated.entity_multi_label,
+            )
 
         if validated.structures is not None:
             for struct_name, struct_input in validated.structures.items():
@@ -373,6 +384,8 @@ class Schema:
                 result["entities"] = dict(self.schema["entity_descriptions"])
             else:
                 result["entities"] = list(self.schema["entities"].keys())
+            if not self._entity_multi_label:
+                result["entity_multi_label"] = False
 
         if self.schema["json_structures"]:
             result["structures"] = {}

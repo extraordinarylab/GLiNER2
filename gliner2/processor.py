@@ -347,12 +347,6 @@ class SchemaTransformer:
             elif hasattr(schema, 'schema'):
                 schema = schema.schema
 
-            # Ensure text ends with punctuation
-            if text and not text.endswith(('.', '!', '?')):
-                text = text + "."
-            elif not text:
-                text = "."
-
             record = {"text": text, "schema": copy.deepcopy(schema)}
 
             try:
@@ -412,7 +406,8 @@ class SchemaTransformer:
 
         # Build outputs
         results = self._build_outputs(
-            processed, schema, text_tokens, len_prefix
+            processed, schema, text_tokens, len_prefix,
+            text, start_idx_map, end_idx_map
         )
 
         # Format input
@@ -522,6 +517,8 @@ class SchemaTransformer:
             end_token_idx=[1],
             text=text or ".",
             schema=schema or {},
+            text_word_first_positions=format_result["text_word_first_positions"],
+            schema_special_positions=format_result["schema_special_positions"],
         )
 
     # =========================================================================
@@ -751,7 +748,15 @@ class SchemaTransformer:
             return
 
         groups = {}
-        for item in schema["relations"]:
+        relation_items = schema["relations"]
+        if isinstance(relation_items, dict):
+            relation_items = [
+                {name: fields}
+                for name, occurrences in relation_items.items()
+                for fields in (occurrences if isinstance(occurrences, list) else [occurrences])
+                if isinstance(fields, dict)
+            ]
+        for item in relation_items:
             if sampling and random.random() < sampling.remove_relations_prob:
                 continue
             for parent, fields in item.items():
@@ -778,7 +783,7 @@ class SchemaTransformer:
             seen = set()
             uniq = []
             for span in spans:
-                t = tuple(tuple(s) if isinstance(s, list) else s for s in span)
+                t = self._freeze_annotation(span)
                 if t not in seen:
                     seen.add(t)
                     uniq.append(span)
@@ -895,7 +900,10 @@ class SchemaTransformer:
             processed: Dict,
             schema: Dict,
             text_tokens: List[str],
-            len_prefix: int
+            len_prefix: int,
+            text: str,
+            start_idx_map: List[int],
+            end_idx_map: List[int],
     ) -> List[Dict]:
         """Build output labels for each schema."""
         results = []
@@ -922,8 +930,9 @@ class SchemaTransformer:
                                         case_insensitive=True
                                     )
                                 else:
-                                    pos = self._find_sublist(
-                                        self._tokenize_text(str(sub)), text_tokens
+                                    pos = self._annotation_positions(
+                                        sub, text_tokens, len_prefix, text,
+                                        start_idx_map, end_idx_map
                                     )
                                 nested.extend(pos)
                             positions.append(nested)
@@ -935,8 +944,9 @@ class SchemaTransformer:
                                     case_insensitive=True
                                 )
                             else:
-                                pos = self._find_sublist(
-                                    self._tokenize_text(str(field)), text_tokens
+                                pos = self._annotation_positions(
+                                    field, text_tokens, len_prefix, text,
+                                    start_idx_map, end_idx_map
                                 )
                             positions.append(pos)
                     transformed.append(positions)
@@ -962,6 +972,59 @@ class SchemaTransformer:
                 })
 
         return results
+
+    @staticmethod
+    def _freeze_annotation(value: Any) -> Any:
+        """Convert nested annotations into a hashable value for deduplication."""
+        if isinstance(value, dict):
+            return tuple(sorted(
+                (key, SchemaTransformer._freeze_annotation(item))
+                for key, item in value.items()
+            ))
+        if isinstance(value, list):
+            return tuple(SchemaTransformer._freeze_annotation(item) for item in value)
+        return value
+
+    def _annotation_positions(
+            self,
+            annotation: Any,
+            text_tokens: List[str],
+            len_prefix: int,
+            text: str,
+            start_idx_map: List[int],
+            end_idx_map: List[int],
+    ) -> List[Tuple[int, int]]:
+        """Resolve a string globally or an explicit character span exactly once."""
+        if not isinstance(annotation, dict):
+            return self._find_sublist(
+                self._tokenize_text(str(annotation)), text_tokens
+            )
+
+        span_text = annotation.get("text")
+        start = annotation.get("start")
+        end = annotation.get("end")
+        if (
+            not isinstance(span_text, str)
+            or not isinstance(start, int) or isinstance(start, bool)
+            or not isinstance(end, int) or isinstance(end, bool)
+            or start < 0 or start >= end or end > len(text)
+            or text[start:end] != span_text
+        ):
+            return [(-1, -1)]
+
+        overlapping = [
+            index for index, (token_start, token_end) in enumerate(
+                zip(start_idx_map, end_idx_map)
+            )
+            if token_start < end and token_end > start
+        ]
+        if not overlapping:
+            return [(-1, -1)]
+
+        first, last = overlapping[0], overlapping[-1]
+        if start_idx_map[first] != start or end_idx_map[last] != end:
+            return [(-1, -1)]
+        return [(first + len_prefix, last + len_prefix)]
 
     def _find_sublist(
             self, 

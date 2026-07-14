@@ -77,6 +77,37 @@ class ValidationError(Exception):
         return self.args[0]
 
 
+def _validate_text_annotation(value: Any, text: str, context: str) -> List[str]:
+    """Validate a string annotation or an explicit ``[start, end)`` span."""
+    if isinstance(value, str):
+        if value and value.lower() not in text.lower():
+            return [f"{context} '{value}' not found in text"]
+        return []
+
+    if not isinstance(value, dict):
+        return [f"{context} must be a string or a span dictionary"]
+
+    span_text = value.get("text")
+    start = value.get("start")
+    end = value.get("end")
+    if not isinstance(span_text, str):
+        return [f"{context} span has missing or non-string text"]
+    if not isinstance(start, int) or isinstance(start, bool):
+        return [f"{context} span has non-integer start"]
+    if not isinstance(end, int) or isinstance(end, bool):
+        return [f"{context} span has non-integer end"]
+    if start >= end:
+        return [f"{context} span must satisfy start < end"]
+    if start < 0 or end > len(text):
+        return [f"{context} span [{start}, {end}) is outside text bounds"]
+    if text[start:end] != span_text:
+        return [
+            f"{context} span text mismatch: expected '{text[start:end]}' "
+            f"at [{start}, {end}), got '{span_text}'"
+        ]
+    return []
+
+
 # =============================================================================
 # Data Format Detection & Loading
 # =============================================================================
@@ -138,7 +169,7 @@ def detect_data_format(data: Any) -> str:
     raise ValueError(f"Unsupported data format: {type(data)}")
 
 
-class DataLoader_Factory:
+class DataLoaderFactory:
     """
     Factory for loading data from various formats into a unified internal format.
     
@@ -186,23 +217,25 @@ class DataLoader_Factory:
         
         # Load based on format
         if fmt == DataFormat.JSONL:
-            records = DataLoader_Factory._load_jsonl(data)
+            records = DataLoaderFactory._load_jsonl(data)
         elif fmt == DataFormat.JSONL_LIST:
-            records = DataLoader_Factory._load_jsonl_list(data)
+            records = DataLoaderFactory._load_jsonl_list(data)
         elif fmt == DataFormat.INPUT_EXAMPLE_LIST:
-            records = DataLoader_Factory._load_input_examples(data)
+            records = DataLoaderFactory._load_input_examples(data)
         elif fmt == DataFormat.TRAINING_DATASET:
-            records = DataLoader_Factory._load_training_dataset(data)
+            records = DataLoaderFactory._load_training_dataset(data)
         elif fmt == DataFormat.DICT_LIST:
-            records = DataLoader_Factory._load_dict_list(data)
+            records = DataLoaderFactory._load_dict_list(data)
         elif fmt == DataFormat.EXTRACTOR_DATASET:
             records = data.data.copy()
         else:
             raise ValueError(f"Unsupported data format: {type(data)}")
+
+        records = [DataLoaderFactory._normalize_record(record) for record in records]
         
         # Validate if requested
         if validate and records:
-            valid_indices, invalid_info = DataLoader_Factory._validate_records(records)
+            valid_indices, invalid_info = DataLoaderFactory._validate_records(records)
             
             if invalid_info:
                 total_records = len(records)
@@ -236,6 +269,48 @@ class DataLoader_Factory:
             records = records[:max_samples]
         
         return records
+
+    @staticmethod
+    def _normalize_record(record: Dict[str, Any]) -> Dict[str, Any]:
+        """Normalize supported dataset variants without discarding span metadata."""
+        if "input" not in record or "output" not in record:
+            return record
+
+        normalized = dict(record)
+        output = dict(record["output"])
+        normalized["output"] = output
+
+        entities = output.get("entities")
+        if isinstance(entities, dict):
+            output["entities"] = {
+                label: mentions if isinstance(mentions, list) else [mentions]
+                for label, mentions in entities.items()
+                if mentions is not None
+            }
+
+        relations = output.get("relations")
+        if isinstance(relations, dict):
+            relation_list = []
+            for relation_name, occurrences in relations.items():
+                if not isinstance(occurrences, list):
+                    occurrences = [occurrences]
+                relation_list.extend(
+                    {relation_name: fields}
+                    for fields in occurrences
+                    if isinstance(fields, dict)
+                )
+            output["relations"] = relation_list
+
+        if not output.get("entity_descriptions") and isinstance(record.get("schema"), list):
+            descriptions = {
+                item["label"]: item["description"]
+                for item in record["schema"]
+                if isinstance(item, dict) and item.get("label") and item.get("description")
+            }
+            if descriptions:
+                output["entity_descriptions"] = descriptions
+
+        return normalized
     
     @staticmethod
     def _load_jsonl(path: Union[str, Path]) -> List[Dict]:
@@ -261,7 +336,7 @@ class DataLoader_Factory:
         """Load from multiple JSONL files."""
         records = []
         for path in paths:
-            records.extend(DataLoader_Factory._load_jsonl(path))
+            records.extend(DataLoaderFactory._load_jsonl(path))
         return records
     
     @staticmethod
@@ -567,7 +642,7 @@ class Relation:
     name: str
     head: Optional[str] = None
     tail: Optional[str] = None
-    _fields: Dict[str, str] = field(default_factory=dict)
+    _fields: Dict[str, Any] = field(default_factory=dict)
 
     def __init__(self, name: str, head: str = None, tail: str = None, **fields):
         self.name = name
@@ -604,15 +679,15 @@ class Relation:
         if not self._fields:
             errors.append(f"Relation '{self.name}' has no fields")
         for field_name, value in self._fields.items():
-            if isinstance(value, str) and value:
-                if value.lower() not in text.lower():
-                    errors.append(f"Relation value '{value}' for '{self.name}.{field_name}' not found in text")
+            errors.extend(_validate_text_annotation(
+                value, text, f"Relation '{self.name}.{field_name}'"
+            ))
         return errors
 
     def get_field_names(self) -> List[str]:
         return list(self._fields.keys())
 
-    def to_dict(self) -> Dict[str, Dict[str, str]]:
+    def to_dict(self) -> Dict[str, Dict[str, Any]]:
         return {self.name: self._fields}
 
 
@@ -625,7 +700,7 @@ class InputExample:
     ----------
     text : str
         The input text for this example.
-    entities : Dict[str, List[str]], optional
+    entities : Dict[str, List[Union[str, Dict[str, Any]]]], optional
         Entity type to mentions mapping.
     entity_descriptions : Dict[str, str], optional
         Descriptions for entity types.
@@ -644,7 +719,7 @@ class InputExample:
     ... )
     """
     text: str
-    entities: Optional[Dict[str, List[str]]] = None
+    entities: Optional[Dict[str, List[Union[str, Dict[str, Any]]]]] = None
     entity_descriptions: Optional[Dict[str, str]] = None
     classifications: Optional[List[Classification]] = None
     structures: Optional[List[Structure]] = None
@@ -682,8 +757,9 @@ class InputExample:
                 if not entity_type:
                     errors.append("Entity type cannot be empty")
                 for mention in mentions:
-                    if mention and mention.lower() not in self.text.lower():
-                        errors.append(f"Entity '{mention}' (type: {entity_type}) not found in text")
+                    errors.extend(_validate_text_annotation(
+                        mention, self.text, "Entity"
+                    ))
 
         if self.entity_descriptions and self.entities:
             for desc_type in self.entity_descriptions:
@@ -752,9 +828,12 @@ class InputExample:
                 # Check if any mention is not in text
                 has_invalid = False
                 for mention in mentions:
-                    if mention and mention.lower() not in self.text.lower():
+                    mention_errors = _validate_text_annotation(
+                        mention, self.text, "Entity"
+                    )
+                    if mention_errors:
                         has_invalid = True
-                        warnings.append(f"Entity '{mention}' (type: {entity_type}) not found in text - dropping entity type")
+                        warnings.append(f"{mention_errors[0]} - dropping entity type")
                         break
                 
                 if has_invalid:
@@ -841,11 +920,13 @@ class InputExample:
                 # Check if any field value is invalid
                 has_invalid = False
                 for field_name, value in rel._fields.items():
-                    if isinstance(value, str) and value:
-                        if value.lower() not in self.text.lower():
-                            warnings.append(f"Relation '{rel.name}' field '{field_name}' value '{value}' not found - dropping relation")
-                            has_invalid = True
-                            break
+                    field_errors = _validate_text_annotation(
+                        value, self.text, f"Relation '{rel.name}.{field_name}'"
+                    )
+                    if field_errors:
+                        warnings.append(f"{field_errors[0]} - dropping relation")
+                        has_invalid = True
+                        break
                 
                 if not has_invalid:
                     valid_relations.append(rel)

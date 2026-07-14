@@ -36,6 +36,7 @@ Basic Examples:
 
 from __future__ import annotations
 
+import atexit
 import gc
 import json
 import logging
@@ -55,7 +56,7 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.cuda.amp import GradScaler, autocast
+from torch.amp import GradScaler, autocast
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader, Dataset, DistributedSampler
@@ -66,7 +67,7 @@ from gliner2.processor import SchemaTransformer, SamplingConfig
 # Import training data classes
 from gliner2.training.data import (
     InputExample, TrainingDataset, ValidationError,
-    DataFormat, detect_data_format, DataLoader_Factory, TrainDataInput
+    DataFormat, detect_data_format, DataLoaderFactory, TrainDataInput
 )
 
 from peft import PeftModel
@@ -284,7 +285,7 @@ class ExtractorDataset(Dataset):
     """
     Dataset for GLiNER2 training with multi-format support.
 
-    Supports all formats through DataLoader_Factory:
+    Supports all formats through DataLoaderFactory:
     - JSONL file path(s)
     - List of InputExample objects
     - TrainingDataset object
@@ -328,7 +329,7 @@ class ExtractorDataset(Dataset):
             checks that entity spans, relation values, and structure
             field values exist in the text.
         """
-        self.data = DataLoader_Factory.load(
+        self.data = DataLoaderFactory.load(
             data=data,
             max_samples=max_samples,
             shuffle=shuffle,
@@ -529,16 +530,20 @@ class GLiNER2Trainer:
 
         self.rank = int(os.environ.get("RANK", "0"))
         self.world_size = int(os.environ.get("WORLD_SIZE", "1"))
+        self._owns_process_group = False
         if self.config.local_rank < 0 and "LOCAL_RANK" in os.environ:
             self.config.local_rank = int(os.environ["LOCAL_RANK"])
 
         self._setup_seed()
         self._setup_device()
+        if self._owns_process_group:
+            atexit.register(self.close)
         self._setup_output_dir()
         self._setup_logging()
 
         self.global_step = 0
         self.epoch = 0
+        self.step_in_epoch = 0
         self.best_metric = float('inf') if not config.greater_is_better else float('-inf')
         self.patience_counter = 0
         self.train_metrics_history = []
@@ -549,6 +554,10 @@ class GLiNER2Trainer:
         self.scaler = None
         self.wandb_run = None
         self.progress_bar = None
+        self._pending_training_state = None
+        self._epoch_start_rng_state = None
+        self._training_max_steps = None
+        self._num_update_steps_per_epoch = None
         
         # LoRA state
         self.lora_layers = {}
@@ -572,6 +581,7 @@ class GLiNER2Trainer:
             if not dist.is_initialized():
                 backend = "nccl" if torch.cuda.is_available() else "gloo"
                 dist.init_process_group(backend=backend)
+                self._owns_process_group = True
             self.rank = dist.get_rank()
             self.world_size = dist.get_world_size()
             if torch.cuda.is_available():
@@ -854,6 +864,23 @@ class GLiNER2Trainer:
             self,
             train_data: TrainDataInput = None,
             eval_data: TrainDataInput = None,
+            resume_from_checkpoint: Optional[Union[str, Path]] = None,
+    ) -> Dict[str, Any]:
+        """Train the model and release any process group owned by this trainer."""
+        try:
+            return self._train_impl(
+                train_data=train_data,
+                eval_data=eval_data,
+                resume_from_checkpoint=resume_from_checkpoint,
+            )
+        finally:
+            self.close()
+
+    def _train_impl(
+            self,
+            train_data: TrainDataInput = None,
+            eval_data: TrainDataInput = None,
+            resume_from_checkpoint: Optional[Union[str, Path]] = None,
     ) -> Dict[str, Any]:
         """
         Main training loop.
@@ -870,12 +897,20 @@ class GLiNER2Trainer:
 
         eval_data : TrainDataInput, optional
             Evaluation data (same formats supported).
+        resume_from_checkpoint : str or Path, optional
+            Resume model, optimizer, scheduler, AMP, counters, and RNG state
+            from a checkpoint produced by this trainer. Pass ``"latest"`` to
+            select the newest checkpoint in ``output_dir``.
 
         Returns
         -------
         Dict[str, Any]
             Training summary with metrics history.
         """
+        if resume_from_checkpoint is not None:
+            checkpoint_path = self._resolve_checkpoint_path(resume_from_checkpoint)
+            self.load_checkpoint(str(checkpoint_path), require_training_state=True)
+
         # Prepare datasets
         train_data = train_data or self.train_data
         eval_data = eval_data or self.eval_data
@@ -926,7 +961,14 @@ class GLiNER2Trainer:
         # Mixed precision
         use_amp = self.config.fp16 or self.config.bf16
         amp_dtype = torch.bfloat16 if self.config.bf16 else torch.float16
-        self.scaler = GradScaler(enabled=self.config.fp16)
+        self.scaler = GradScaler(self.device.type, enabled=self.config.fp16)
+        self._training_max_steps = max_steps
+        self._num_update_steps_per_epoch = num_update_steps_per_epoch
+
+        resumed = self._pending_training_state is not None
+        if resumed:
+            self._restore_training_state(self._pending_training_state)
+            self._pending_training_state = None
 
         # Logging
         logger.info("***** Running Training *****")
@@ -955,30 +997,73 @@ class GLiNER2Trainer:
         # Training state
         self.model.train()
         self.processor.change_mode(is_training=True)
-        self.global_step = 0
-        self.epoch = 0
+        if not resumed:
+            self.global_step = 0
+            self.epoch = 0
+            self.step_in_epoch = 0
+            self.train_metrics_history = []
+            self.eval_metrics_history = []
         tr_loss = 0.0
 
         start_time = time.time()
         samples_seen = 0
 
-        self.progress_bar = tqdm(total=max_steps, desc="Training", disable=not self.is_main_process)
+        self.progress_bar = tqdm(
+            total=max_steps,
+            initial=min(self.global_step, max_steps),
+            desc="Training",
+            disable=not self.is_main_process,
+        )
 
         should_stop = False
-        for epoch in range(num_epochs):
+        resume_epoch = self.epoch if resumed else 0
+        resume_step = self.step_in_epoch if resumed else 0
+        if len(train_loader) > 0 and resume_step >= len(train_loader):
+            resume_epoch += resume_step // len(train_loader)
+            resume_step %= len(train_loader)
+        if self.global_step >= max_steps:
+            logger.info(
+                "Checkpoint already reached max_steps=%s; no additional updates needed",
+                max_steps,
+            )
+            resume_epoch = num_epochs
+
+        for epoch in range(resume_epoch, num_epochs):
             self.epoch = epoch
 
             if self.is_distributed:
                 train_loader.sampler.set_epoch(epoch)
 
+            checkpoint_rng_state = None
+            if resumed and epoch == resume_epoch and resume_step > 0:
+                checkpoint_rng_state = self._capture_rng_state()
+                if self._epoch_start_rng_state is not None:
+                    self._restore_rng_state(self._epoch_start_rng_state)
+                else:
+                    logger.warning(
+                        "Checkpoint has no epoch-start RNG state; data order may differ after resume"
+                    )
+            else:
+                resume_step = 0
+                self.step_in_epoch = 0
+                self._epoch_start_rng_state = self._capture_rng_state()
+
             epoch_loss = 0.0
             epoch_steps = 0
+            restored_checkpoint_rng = checkpoint_rng_state is None
 
             for step, batch in enumerate(train_loader):
+                if step < resume_step:
+                    continue
+                if not restored_checkpoint_rng:
+                    self._restore_rng_state(checkpoint_rng_state)
+                    restored_checkpoint_rng = True
+
+                self.step_in_epoch = step + 1
                 samples_seen += len(batch)
 
                 try:
-                    with autocast(enabled=use_amp, dtype=amp_dtype):
+                    with autocast(self.device.type, enabled=use_amp, dtype=amp_dtype):
                         outputs = self.model(batch)
                         loss = outputs["total_loss"]
 
@@ -1069,7 +1154,7 @@ class GLiNER2Trainer:
                 break
 
             # Fix Bug #6: Flush incomplete gradient accumulation at end of epoch
-            if epoch_steps % self.config.gradient_accumulation_steps != 0:
+            if self.step_in_epoch % self.config.gradient_accumulation_steps != 0:
                 grad_norm = self._flush_gradients()
                 if grad_norm is not None:
                     logger.info(f"Applied incomplete gradient accumulation at end of epoch {epoch + 1}")
@@ -1089,14 +1174,17 @@ class GLiNER2Trainer:
                         break
                 self._save_checkpoint(f"checkpoint-epoch-{epoch + 1}")
 
+            resume_step = 0
+            resumed = False
+
             if self.global_step >= max_steps:
                 break
 
         self.progress_bar.close()
         self.progress_bar = None
 
+        self._save_checkpoint("final")
         if self.is_main_process:
-            self._save_checkpoint("final")
             if self.config.report_to_wandb:
                 import wandb
                 wandb.summary["best_metric"] = self.best_metric
@@ -1113,6 +1201,23 @@ class GLiNER2Trainer:
             "train_metrics_history": self.train_metrics_history,
             "eval_metrics_history": self.eval_metrics_history,
         }
+
+    def close(self):
+        """Destroy a process group created by this trainer; safe to call repeatedly."""
+        if not self._owns_process_group:
+            return
+        try:
+            if dist.is_available() and dist.is_initialized():
+                dist.destroy_process_group()
+        finally:
+            self._owns_process_group = False
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self.close()
+        return False
 
     def _evaluate(self, eval_dataset: ExtractorDataset) -> Dict[str, float]:
         logger.info("Running evaluation...")
@@ -1147,7 +1252,7 @@ class GLiNER2Trainer:
 
         with torch.no_grad():
             for batch in tqdm(eval_loader, desc="Evaluating", disable=not self.is_main_process):
-                with autocast(enabled=use_amp, dtype=amp_dtype):
+                with autocast(self.device.type, enabled=use_amp, dtype=amp_dtype):
                     outputs = self.model(batch)
 
                 # Fix Bug #10: Move tensors to CPU to prevent memory leak
@@ -1270,11 +1375,18 @@ class GLiNER2Trainer:
             self.train_metrics_history.append(metrics)
 
     def _save_checkpoint(self, name: str):
-        if not self.is_main_process:
-            return
-
         checkpoint_dir = self.output_dir / name
         checkpoint_dir.mkdir(exist_ok=True)
+        if self.is_distributed:
+            torch.save(
+                {
+                    "rng_state": self._capture_rng_state(),
+                    "epoch_start_rng_state": self._epoch_start_rng_state,
+                },
+                checkpoint_dir / f"rng_state_rank{self.rank}.pt",
+            )
+        if not self.is_main_process:
+            return
 
         save_start = time.time()
         model_to_save = self._unwrap_model()
@@ -1307,6 +1419,31 @@ class GLiNER2Trainer:
                 model_to_save.save_pretrained(str(checkpoint_dir))
             checkpoint_type = "full"
             trainable_params = sum(p.numel() for p in model_to_save.parameters())
+
+        trainer_state = {
+            "format_version": 1,
+            "optimizer": self.optimizer.state_dict() if self.optimizer is not None else None,
+            "scheduler": self.scheduler.state_dict() if self.scheduler is not None else None,
+            "scaler": self.scaler.state_dict() if self.scaler is not None else None,
+            "global_step": self.global_step,
+            "epoch": self.epoch,
+            "step_in_epoch": self.step_in_epoch,
+            "best_metric": self.best_metric,
+            "patience_counter": self.patience_counter,
+            "train_metrics_history": self.train_metrics_history,
+            "eval_metrics_history": self.eval_metrics_history,
+            "rng_state": self._capture_rng_state(),
+            "epoch_start_rng_state": self._epoch_start_rng_state,
+            "training_max_steps": self._training_max_steps,
+            "num_update_steps_per_epoch": self._num_update_steps_per_epoch,
+            "batch_size": self.config.batch_size,
+            "gradient_accumulation_steps": self.config.gradient_accumulation_steps,
+            "world_size": self.world_size,
+        }
+        state_path = checkpoint_dir / "trainer_state.pt"
+        temporary_state_path = checkpoint_dir / "trainer_state.pt.tmp"
+        torch.save(trainer_state, temporary_state_path)
+        os.replace(temporary_state_path, state_path)
         
         save_time = time.time() - save_start
         checkpoint_size_mb = sum(f.stat().st_size for f in checkpoint_dir.rglob('*') if f.is_file()) / (1024 * 1024)
@@ -1340,6 +1477,80 @@ class GLiNER2Trainer:
 
         self._cleanup_checkpoints()
 
+    @staticmethod
+    def _capture_rng_state() -> Dict[str, Any]:
+        """Capture RNG state required to continue stochastic training."""
+        return {
+            "python": random.getstate(),
+            "numpy": np.random.get_state(),
+            "torch": torch.get_rng_state(),
+            "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+        }
+
+    @staticmethod
+    def _restore_rng_state(state: Optional[Dict[str, Any]]):
+        if not state:
+            return
+        random.setstate(state["python"])
+        np.random.set_state(state["numpy"])
+        torch.set_rng_state(state["torch"].cpu())
+        if state.get("cuda") is not None and torch.cuda.is_available():
+            torch.cuda.set_rng_state_all([rng.cpu() for rng in state["cuda"]])
+
+    def _restore_training_state(self, state: Dict[str, Any]):
+        """Restore non-model state after optimizer/scheduler construction."""
+        if state.get("optimizer") is not None:
+            self.optimizer.load_state_dict(state["optimizer"])
+        if state.get("scheduler") is not None:
+            self.scheduler.load_state_dict(state["scheduler"])
+        if state.get("scaler") is not None:
+            self.scaler.load_state_dict(state["scaler"])
+
+        self.global_step = int(state.get("global_step", 0))
+        self.epoch = int(state.get("epoch", 0))
+        self.step_in_epoch = int(state.get("step_in_epoch", 0))
+        self.best_metric = state.get("best_metric", self.best_metric)
+        self.patience_counter = int(state.get("patience_counter", 0))
+        self.train_metrics_history = state.get("train_metrics_history", [])
+        self.eval_metrics_history = state.get("eval_metrics_history", [])
+        self._epoch_start_rng_state = state.get("epoch_start_rng_state")
+
+        compatibility_fields = {
+            "training_max_steps": self._training_max_steps,
+            "num_update_steps_per_epoch": self._num_update_steps_per_epoch,
+            "batch_size": self.config.batch_size,
+            "gradient_accumulation_steps": self.config.gradient_accumulation_steps,
+            "world_size": self.world_size,
+        }
+        for key, current_value in compatibility_fields.items():
+            saved_value = state.get(key)
+            if saved_value is not None and saved_value != current_value:
+                logger.warning(
+                    "Resume setting changed for %s: checkpoint=%s, current=%s",
+                    key, saved_value, current_value,
+                )
+
+        self._restore_rng_state(state.get("rng_state"))
+        logger.info(
+            "Restored training state at global step %s, epoch %s, batch %s",
+            self.global_step, self.epoch, self.step_in_epoch,
+        )
+
+    def _resolve_checkpoint_path(self, checkpoint: Union[str, Path]) -> Path:
+        if str(checkpoint) != "latest":
+            return Path(checkpoint)
+        candidates = [
+            path for path in self.output_dir.iterdir()
+            if path.is_dir()
+            and path.name.startswith("checkpoint-")
+            and (path / "trainer_state.pt").exists()
+        ]
+        if not candidates:
+            raise FileNotFoundError(
+                f"No resumable checkpoints found in {self.output_dir}"
+            )
+        return max(candidates, key=lambda path: path.stat().st_mtime)
+
     def _cleanup_checkpoints(self):
         if self.config.save_total_limit <= 0:
             return
@@ -1356,36 +1567,62 @@ class GLiNER2Trainer:
             shutil.rmtree(oldest)
             logger.info(f"Removed old checkpoint: {oldest.name}")
 
-    def load_checkpoint(self, checkpoint_path: str):
-        """Load model weights from a checkpoint (adapter-only or full)."""
+    def load_checkpoint(self, checkpoint_path: str, require_training_state: bool = False):
+        """Load model weights and queue trainer state for the next ``train`` call."""
         checkpoint_dir = Path(checkpoint_path)
+        if not checkpoint_dir.is_dir():
+            raise FileNotFoundError(f"Checkpoint directory not found: {checkpoint_dir}")
         is_adapter = (checkpoint_dir / "adapter_config.json").exists()
 
         if is_adapter:
             logger.info("Loading LoRA adapter from %s", checkpoint_path)
             model_to_load = self._unwrap_model()
-            base = model_to_load.get_base_model() if isinstance(model_to_load, PeftModel) else model_to_load
-            loaded_model = PeftModel.from_pretrained(base, str(checkpoint_dir))
+            base = model_to_load.unload() if isinstance(model_to_load, PeftModel) else model_to_load
+            loaded_model = PeftModel.from_pretrained(
+                base, str(checkpoint_dir), is_trainable=True
+            )
             loaded_model.to(self.device)
-            if isinstance(self.model, DDP):
-                self.model.module = loaded_model
-            else:
-                self.model = loaded_model
+            self.model = loaded_model
+            self._setup_ddp()
             self.lora_layers = {n: m for n, m in self._unwrap_model().named_modules() if isinstance(m, _PeftLoraLayer)}
             self._unwrap_model()._lora_layers = self.lora_layers
         else:
-            model_cls = self._unwrap_model().__class__
+            current_model = self._unwrap_model()
+            if isinstance(current_model, PeftModel):
+                current_model = current_model.unload()
+            model_cls = current_model.__class__
             loaded_model = model_cls.from_pretrained(str(checkpoint_dir))
             loaded_model.to(self.device)
-            if isinstance(self.model, DDP):
-                self.model.module = loaded_model
-            else:
-                self.model = loaded_model
+            self.model = loaded_model
             if self.config.use_lora:
                 logger.info("Applying LoRA to loaded model...")
                 self.lora_layers = {}
                 self._setup_lora()
-                self._setup_ddp()
+            self._setup_ddp()
+
+        loaded_processor = getattr(self._unwrap_model(), "processor", None)
+        if loaded_processor is not None:
+            self.processor = loaded_processor
+
+        state_path = checkpoint_dir / "trainer_state.pt"
+        if state_path.exists():
+            self._pending_training_state = torch.load(
+                state_path, map_location="cpu", weights_only=False
+            )
+            rank_state_path = checkpoint_dir / f"rng_state_rank{self.rank}.pt"
+            if rank_state_path.exists():
+                rank_state = torch.load(
+                    rank_state_path, map_location="cpu", weights_only=False
+                )
+                self._pending_training_state["rng_state"] = rank_state.get("rng_state")
+                self._pending_training_state["epoch_start_rng_state"] = rank_state.get(
+                    "epoch_start_rng_state"
+                )
+        elif require_training_state:
+            raise ValueError(
+                f"Checkpoint {checkpoint_dir} contains model weights only and cannot "
+                "resume optimizer/scheduler state"
+            )
 
         logger.info("Loaded checkpoint: %s", checkpoint_path)
 
@@ -1399,6 +1636,7 @@ def train_gliner2(
         train_data: TrainDataInput,
         output_dir: str = "./output",
         eval_data: TrainDataInput = None,
+        resume_from_checkpoint: Optional[Union[str, Path]] = None,
         **config_kwargs,
 ) -> Dict[str, Any]:
     """
@@ -1418,6 +1656,8 @@ def train_gliner2(
         Output directory for checkpoints.
     eval_data : TrainDataInput, optional
         Evaluation data.
+    resume_from_checkpoint : str or Path, optional
+        Full trainer checkpoint to resume, or ``"latest"``.
     **config_kwargs
         Additional TrainingConfig parameters.
 
@@ -1448,4 +1688,8 @@ def train_gliner2(
     config = TrainingConfig(output_dir=output_dir, **config_kwargs)
 
     trainer = GLiNER2Trainer(model=model, config=config)
-    return trainer.train(train_data=train_data, eval_data=eval_data)
+    return trainer.train(
+        train_data=train_data,
+        eval_data=eval_data,
+        resume_from_checkpoint=resume_from_checkpoint,
+    )
